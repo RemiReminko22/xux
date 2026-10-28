@@ -13,6 +13,7 @@ Run:  python test_il2cpp_auto.py
 import json
 import os
 import struct
+import sys
 import tempfile
 
 from il2cpp_auto import OffsetGrabber, GameImage, LayoutDetector
@@ -190,6 +191,10 @@ class ImageBuilder:
         self.w64(blob + slot * 8, obj)
         return blob, obj
 
+    def set_object_field(self, obj_va, off, value):
+        """Write a reference into a fake GC object (heap, not image)."""
+        struct.pack_into("<Q", self.heap, obj_va - HEAP_BASE + off, value)
+
 
 
 def build_world():
@@ -240,9 +245,16 @@ def build_world():
         ], 0x28)
 
     count = b.build()
-    blob, obj = b.make_static_object("PlayerRoot", blob_index=0, slot=0)
+    blob, root_obj = b.make_static_object("PlayerRoot", blob_index=0, slot=0)
+    health_obj = b.heap_object(b.class_by_name("PlayerHealth")["class_va"])
+    arming_obj = b.heap_object(b.class_by_name("PlayerArming")["class_va"])
+    b.set_object_field(root_obj, 0xB8, health_obj)     # PlayerRoot.playerHealth
+    b.set_object_field(root_obj, 0xA8, arming_obj)     # PlayerRoot.playerArming
+    b.set_object_field(health_obj, 0xD0, 100)          # lastKnownHealth int32
+    b.live = {"root": root_obj, "health": health_obj, "arming": arming_obj,
+              "blob": blob}
     pm = FakePM([(IMAGE_BASE, bytes(b.buf)), (HEAP_BASE, bytes(b.heap))])
-    return pm, b, count, blob, obj
+    return pm, b, count, blob, root_obj
 
 
 def silence(*_a, **_k):
@@ -370,11 +382,83 @@ def test_report_and_find():
 def main():
     test_layout_detection()
     test_full_dump()
+    test_static_slots()
+    test_trainer_wiring()
     test_cache_and_codegen()
     test_report_and_find()
     print("\nALL TESTS PASSED")
 
 
+
+def test_static_slots():
+    """Statics have no metadata offset — they must be identified by object class."""
+    pm, b, count, blob, root_obj = build_world()
+    tmp = tempfile.mkdtemp()
+    g = OffsetGrabber(pm=pm, ga_base=IMAGE_BASE, ga_size=IMAGE_SIZE,
+                      process_name="fake",
+                      cache_path=os.path.join(tmp, "c.json"), log=silence)
+    g.attach()
+    g.dump()
+    slots = g.static_slots("PlayerRoot", slots=8)
+    assert slots == {0: "PlayerRoot"}, slots
+    assert g.class_name_of(root_obj) == "PlayerRoot"
+    print(f"[ok] static_slots(PlayerRoot) -> {slots}")
+
+
+def test_trainer_wiring():
+    """Import the trainer with stubbed pymem/keyboard and check its offset and
+    pointer-chain logic against the fake build."""
+    import types
+
+    if "pymem" not in sys.modules:
+        pymem_stub = types.ModuleType("pymem")
+        pymem_stub.Pymem = object
+        proc = types.ModuleType("pymem.process")
+        proc.module_from_name = lambda *a, **k: None
+        pymem_stub.process = proc
+        sys.modules["pymem"] = pymem_stub
+        sys.modules["pymem.process"] = proc
+    if "keyboard" not in sys.modules:
+        kb = types.ModuleType("keyboard")
+        kb.is_pressed = lambda *a, **k: False
+        sys.modules["keyboard"] = kb
+
+    import combatmaster_bypass as cb
+
+    pm, b, count, blob, root_obj = build_world()
+    tmp = tempfile.mkdtemp()
+    g = OffsetGrabber(pm=pm, ga_base=IMAGE_BASE, ga_size=IMAGE_SIZE,
+                      process_name="fake",
+                      cache_path=os.path.join(tmp, "c.json"), log=silence)
+    g.attach()
+    g.dump()
+
+    t = cb.CombatMasterBypass()
+    t.pm = pm
+    t.ga_base = IMAGE_BASE
+    t.ga_size = IMAGE_SIZE
+    t.grabber = g
+    t.grabber_ok = True
+    t._resolve_offsets()
+    t._resolve_static_fields()
+
+    assert t.off["pr_health"] == 0xB8, hex(t.off["pr_health"])
+    assert t.off["pr_arming"] == 0xA8, hex(t.off["pr_arming"])
+    assert t.off["ph_last"] == 0xD0, hex(t.off["ph_last"])
+    assert t.off["pa_active"] == 0x538, hex(t.off["pa_active"])
+    assert t.off["pr_myplayer"] == 0, hex(t.off["pr_myplayer"])
+    assert t.off_source["pr_health"] == "dump:PlayerRoot.playerHealth"
+
+    assert t._refresh() is True, "pointer chain broken"
+    assert t.my_player == root_obj
+    assert t.player_health == b.live["health"]
+    assert t.player_arming == b.live["arming"]
+    assert t.weapon_ptr_off == 0x538
+
+    t.show_learned()          # must not raise
+    print(f"[ok] trainer wiring: MyPlayer=0x{t.my_player:X} "
+          f"PlayerHealth=0x{t.player_health:X} pa_active=+0x{t.weapon_ptr_off:X}")
+
+
 if __name__ == "__main__":
     main()
-

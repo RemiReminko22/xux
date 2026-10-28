@@ -50,6 +50,7 @@ MAX_IMAGE_BYTES = 512 << 20        # refuse to snapshot an absurd module
 CLASS_SCAN_SPAN = 0x140            # offsets probed inside Il2CppClass
 FIELD_SCAN_SPAN = 0x30             # offsets probed inside Il2CppFieldInfo
 MAX_FIELDS = 1024                  # per-class sanity cap
+MIN_TABLE_SCORE = 5                # of 8 neighbours decode as classes
 
 # IL2CPP_TYPE_* -> C-ish name, used for best-effort field typing
 IL2CPP_TYPE_NAMES = {
@@ -368,7 +369,7 @@ class LayoutDetector:
                             continue
                         score, table = self._score_class(img.base + cls_rva,
                                                          name_off)
-                        if score >= 7:
+                        if score >= MIN_TABLE_SCORE:
                             found.append((score, table, name_off, cls_rva))
             if not found:
                 continue
@@ -737,7 +738,7 @@ class LayoutDetector:
                         continue
                     score, _table = self._score_class(img.base + cls_rva,
                                                       name_off)
-                    if score >= 7:
+                    if score >= MIN_TABLE_SCORE:
                         return img.base + cls_rva, name_off
         return None, None
 
@@ -785,7 +786,7 @@ class OffsetGrabber:
         self.ga_size = mod.SizeOfImage
         return self
 
-    def attach(self, module_check=True):
+    def attach(self):
         if self.pm is None or self.ga_base is None:
             raise RuntimeError("no process attached")
         self.img = GameImage(self.pm, self.ga_base, self.ga_size, log=self.log)
@@ -1024,6 +1025,62 @@ class OffsetGrabber:
         if info and info.get("statics_rva"):
             return self.ga_base + info["statics_rva"]
         return None
+
+    def _ptr_any(self, va):
+        """u64 read that works for image and heap addresses alike."""
+        if not is_ptr(va):
+            return None
+        if self.img is not None and self.img.in_image(va):
+            return self.img.va_u64(va)
+        try:
+            return self.pm.read_longlong(va) & 0xFFFF_FFFF_FFFF_FFFF
+        except Exception:
+            return None
+
+    def _cstr_any(self, va, max_len=128):
+        if not is_ptr(va):
+            return None
+        if self.img is not None and self.img.in_image(va):
+            return self.img.va_cstr(va, max_len)
+        try:
+            data = self.pm.read_bytes(va, max_len)
+        except Exception:
+            return None
+        end = data.find(b"\x00")
+        if end < 0:
+            return None
+        return data[:end].decode("utf-8", errors="ignore")
+
+    def class_name_of(self, obj_va):
+        """Klass name of a live GC object (first qword is its Il2CppClass*)."""
+        k = self._ptr_any(obj_va)
+        if not is_ptr(k):
+            return None
+        off = self.layout.name_off if self.layout else None
+        if off is None:
+            return None
+        return self._cstr_any(self._ptr_any(k + off), 96)
+
+    def static_slots(self, type_name, slots=16, ns=None):
+        """{blob offset: class name of the object stored there}.
+
+        Static-field offsets are not in the metadata (il2cpp assigns them at
+        runtime), so instead of guessing we identify each slot by the class of
+        the object that currently sits in it. `PlayerRoot.MyPlayer` is simply the
+        slot whose object is a PlayerRoot.
+        """
+        base = self.statics_va(type_name, ns)
+        if not base:
+            return {}
+        out = {}
+        for s in range(0, slots * 8, 8):
+            v = self._ptr_any(base + s)
+            if not is_ptr(v) or (self.img and self.img.in_image(v)):
+                continue
+            name = self.class_name_of(v)
+            if name:
+                out[s] = name
+        return out
 
     def resolve(self, spec: str, default=None):
         """'CombatMaster.PlayerRoot.playerHealth' or 'PlayerRoot.playerHealth'
