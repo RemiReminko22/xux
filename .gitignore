@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+offsets_cache.json*
+il2cpp_offsets_generated.h
+offsets_generated.py
