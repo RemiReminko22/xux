@@ -941,9 +941,11 @@ class OffsetGrabber:
         self.meta = meta
         self.types = payload.get("types", {})
         self._by_short = {}
+        base = self.ga_base
         for key, info in self.types.items():
             self._by_short.setdefault(info.get("name", key), []).append(key)
-            self._class_va[key] = self.ga_base + info["rva"]
+            if base is not None:
+                self._class_va[key] = base + info["rva"]
         lay = meta.get("layout")
         if lay:
             self.layout = Layout()
@@ -976,7 +978,7 @@ class OffsetGrabber:
 
     def class_va(self, type_name, ns=None):
         info = self.type_info(type_name, ns)
-        if not info:
+        if not info or self.ga_base is None:
             return None
         return self.ga_base + info["rva"]
 
